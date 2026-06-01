@@ -16,6 +16,9 @@
 #
 # Pin the version for reproducible deploys:
 #   CACHESTREAM_VERSION=1.6.0 docker compose ... up -d
+#
+# Pin a different GHCR owner if you publish from another fork:
+#   CACHESTREAM_GHCR_OWNER=cachenetworks docker compose ... up -d
 # =========================================================
 services:
   web:
@@ -23,9 +26,13 @@ services:
     # to pull from GHCR. The base file's `build:` stanza is still
     # present but only consulted if no image is found locally
     # — `pull_policy: always` makes sure we get the registry copy.
-    image: ghcr.io/cachenetworks/cachestream-web:${CACHESTREAM_VERSION:-latest}
+    image: ghcr.io/${CACHESTREAM_GHCR_OWNER:-nekosuneprojectsforks}/cachestream-web:${CACHESTREAM_VERSION:-latest}
     pull_policy: always
 
   streamer:
-    image: ghcr.io/cachenetworks/cachestream-streamer:${CACHESTREAM_VERSION:-latest}
+    image: ghcr.io/${CACHESTREAM_GHCR_OWNER:-nekosuneprojectsforks}/cachestream-streamer:${CACHESTREAM_VERSION:-latest}
+    pull_policy: always
+
+  ingest:
+    image: ghcr.io/${CACHESTREAM_GHCR_OWNER:-nekosuneprojectsforks}/cachestream-ingest:${CACHESTREAM_VERSION:-latest}
     pull_policy: always

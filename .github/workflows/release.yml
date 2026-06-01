@@ -1,20 +1,22 @@
 # =========================================================
 # CacheStream release workflow
 # =========================================================
-# Builds multi-arch (amd64 + arm64) Docker images for both
-# apps and pushes them to GitHub Container Registry.
+# Builds multi-arch (amd64 + arm64) Docker images for all runtime
+# services and pushes them to GitHub Container Registry.
 #
 # Triggers:
-#   - tag push matching `v*` (e.g. v1.6.0)  → tagged + latest
-#   - workflow_dispatch (manual run)        → only `latest`
+#   - tag push matching `v*` or `[0-9]*` -> tagged + latest + GitHub Release
+#   - workflow_dispatch without version   -> manual-<sha> + latest Docker images
+#   - workflow_dispatch with version      -> tagged + latest + GitHub Release
 #
 # Images:
 #   ghcr.io/<owner>/cachestream-web:<version> + :latest
 #   ghcr.io/<owner>/cachestream-streamer:<version> + :latest
+#   ghcr.io/<owner>/cachestream-ingest:<version> + :latest
 #
 # The Pi 4 / Pi 5 / other ARM users get arm64; everyone else
 # gets amd64 transparently via the multi-arch manifest. That's
-# what makes `docker compose --profile ghcr up` work for both.
+# what makes the GHCR compose overlay work for both.
 # =========================================================
 name: release
 
@@ -22,7 +24,13 @@ on:
   push:
     tags:
       - "v*"
+      - "[0-9]*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version/tag to publish, for example 1.14.0 or v1.14.0"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -65,15 +73,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Compute the version tag from the git ref. `v1.6.0` → `1.6.0`.
-      # On workflow_dispatch the version is "manual-<sha>".
+      # Compute the version tag from the dispatch input or git tag.
+      # Image tags strip a leading `v`, so `v1.6.0` becomes `1.6.0`.
       - id: meta
         name: Compute tags
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           IMAGE="ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}"
           IMAGE="${IMAGE,,}"   # lowercase — GHCR rejects mixed-case repo names
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            VERSION="${GITHUB_REF#refs/tags/v}"
+          if [[ -n "$DISPATCH_VERSION" ]]; then
+            VERSION="${DISPATCH_VERSION#v}"
+            echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            VERSION="${REF_NAME#v}"
             echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest" >> "$GITHUB_OUTPUT"
           else
             VERSION="manual-${GITHUB_SHA::7}"
@@ -102,20 +117,57 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
 
+      - name: Summarize published image
+        run: |
+          echo "Published \`${{ steps.meta.outputs.tags }}\`" >> "$GITHUB_STEP_SUMMARY"
+
   release:
     needs: build
-    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
+
+      - id: release_meta
+        name: Compute release metadata
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ -n "$DISPATCH_VERSION" ]]; then
+            TAG="$DISPATCH_VERSION"
+            VERSION="${DISPATCH_VERSION#v}"
+            SHOULD_RELEASE=true
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            TAG="$REF_NAME"
+            VERSION="${REF_NAME#v}"
+            SHOULD_RELEASE=true
+          else
+            TAG=""
+            VERSION="manual-${GITHUB_SHA::7}"
+            SHOULD_RELEASE=false
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "should_release=${SHOULD_RELEASE}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Manual dispatch summary
+        if: steps.release_meta.outputs.should_release != 'true'
+        run: |
+          echo "Docker images were published by the build jobs." >> "$GITHUB_STEP_SUMMARY"
+          echo "Set the workflow dispatch version input, or push a version tag, to create a GitHub Release." >> "$GITHUB_STEP_SUMMARY"
+
       # Create a GitHub Release for the tag with the body taken
       # from CHANGELOG.md (if a matching `## X.Y.Z` section exists).
       - name: Extract release notes from CHANGELOG
+        if: steps.release_meta.outputs.should_release == 'true'
         id: notes
         run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          VERSION="${{ steps.release_meta.outputs.version }}"
           if [[ -f CHANGELOG.md ]]; then
             # Grab from the heading of THIS version down to the next ## heading.
             awk -v v="$VERSION" '
@@ -135,9 +187,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - uses: softprops/action-gh-release@v2
+        if: steps.release_meta.outputs.should_release == 'true'
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ steps.release_meta.outputs.tag }}
           name:     CacheStream ${{ steps.notes.outputs.version }}
           body:     ${{ steps.notes.outputs.notes }}
+          target_commitish: ${{ github.sha }}
           draft:    false
           prerelease: false

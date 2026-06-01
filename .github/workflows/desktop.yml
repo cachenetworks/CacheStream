@@ -1,0 +1,131 @@
+# =========================================================
+# CacheStream desktop build + release
+# =========================================================
+# Builds the native (Electron) desktop app for Linux + Windows,
+# x64 + arm64, and attaches the installers to the GitHub Release
+# created for the tag.
+#
+# Each arch builds on a NATIVE runner. This matters because:
+#   - ffmpeg-static ships a per-host binary (no win-arm64 build —
+#     we vendor one for that target, see the step below), and
+#   - better-sqlite3 in the bundled web panel is rebuilt against
+#     Electron's ABI for the target arch, which is far simpler
+#     native than cross-compiled.
+#
+# Triggers: tag push `v*`/numeric, or manual dispatch. Manual dispatch
+# uploads to a release when `version` is set, otherwise artifacts only.
+# =========================================================
+name: desktop
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "[0-9]*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional release tag to upload installers to, for example 1.14.0 or v1.14.0"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,   os: ubuntu-latest,    script: "dist -- --linux --x64 --publish=never" }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, script: "dist -- --linux --arm64 --publish=never" }
+          - { name: win-x64,     os: windows-latest,   script: "dist -- --win --x64 --publish=never" }
+          - { name: win-arm64,   os: windows-11-arm,   script: "dist -- --win --arm64 --publish=never" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # AppImage tooling + package helpers on the Linux runners.
+      - name: Linux build deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libarchive-tools fakeroot rpm
+
+      # electron-builder's bundled fpm is linux-x86 only. The ARM64
+      # runner must use a native Ruby-installed fpm for .deb packaging.
+      - name: Linux arm64 fpm deps
+        if: matrix.name == 'linux-arm64'
+        run: |
+          sudo apt-get install -y --no-install-recommends ruby ruby-dev build-essential
+          sudo gem install --no-document fpm
+          fpm --version
+          echo "USE_SYSTEM_FPM=true" >> "$GITHUB_ENV"
+
+      - name: Install desktop deps
+        working-directory: apps/desktop
+        run: npm install --no-audit --no-fund
+
+      # ffmpeg-static has no win32-arm64 binary — vendor one so the
+      # builder copies it into resources/ffmpeg for that target.
+      - name: Vendor win-arm64 ffmpeg
+        if: matrix.name == 'win-arm64'
+        shell: pwsh
+        run: |
+          $dst = "apps/desktop/build/ffmpeg/win32-arm64"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $zip = "$env:RUNNER_TEMP\ff.zip"
+          # BtbN publishes win-arm64 ffmpeg builds.
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-winarm64-gpl.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\ff" -Force
+          Copy-Item (Get-ChildItem -Recurse "$env:RUNNER_TEMP\ff\*\bin\ffmpeg.exe").FullName -Destination "$dst\ffmpeg.exe"
+
+      - name: Build ${{ matrix.name }}
+        working-directory: apps/desktop
+        run: npm run ${{ matrix.script }}
+
+      - id: release_meta
+        name: Compute release target
+        shell: pwsh
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = $env:DISPATCH_VERSION
+          if (-not $tag -and $env:REF_TYPE -eq "tag") {
+            $tag = $env:REF_NAME
+          }
+          if ($tag) {
+            "publish=true" >> $env:GITHUB_OUTPUT
+            "tag=$tag" >> $env:GITHUB_OUTPUT
+          } else {
+            "publish=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Upload installers to release
+        if: steps.release_meta.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_meta.outputs.tag }}
+          files: |
+            apps/desktop/dist/*.AppImage
+            apps/desktop/dist/*.deb
+            apps/desktop/dist/*.exe
+          fail_on_unmatched_files: false
+
+      - name: Upload installers as workflow artifacts
+        if: steps.release_meta.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachestream-${{ matrix.name }}
+          path: |
+            apps/desktop/dist/*.AppImage
+            apps/desktop/dist/*.deb
+            apps/desktop/dist/*.exe
+          if-no-files-found: ignore

@@ -59,12 +59,31 @@ function detectHost() {
   return { arch, cores, cpuModel, totalMemGB, piModel, isPi, isPi5, isWeakArm };
 }
 
+function pathExists(path) {
+  try { return fs.existsSync(path); } catch { return false; }
+}
+
+function hasNvidiaDevice() {
+  return pathExists("/dev/nvidiactl") || pathExists("/dev/nvidia0");
+}
+
+function hasIntelRenderDevice() {
+  return pathExists("/dev/dri/renderD128") || pathExists("/dev/dri/card0");
+}
+
 // ---- Hardware encoder probing ----------------------------------
 
 function ffmpegEncoders() {
   try {
-    const out = execSync("ffmpeg -hide_banner -encoders 2>/dev/null", {
-      encoding: "utf8", timeout: 4000,
+    // FFMPEG_PATH lets the Electron desktop build point at its
+    // bundled static binary (there's no ffmpeg on PATH on Windows).
+    // In Docker it's unset and we fall back to the PATH `ffmpeg`.
+    // Quote the path so spaces in a Windows install dir survive the
+    // shell. `2>NUL`/`2>/dev/null` differ per-OS, so just drop the
+    // redirect and let stderr flow to our (ignored) parent stderr.
+    const bin = process.env.FFMPEG_PATH || "ffmpeg";
+    const out = execSync(`"${bin}" -hide_banner -encoders`, {
+      encoding: "utf8", timeout: 4000, stdio: ["ignore", "pipe", "ignore"],
     });
     return out;
   } catch {
@@ -78,8 +97,6 @@ function ffmpegEncoders() {
  *   - h264_v4l2m2m  (Raspberry Pi hardware encoder — Pi 4 only)
  *   - h264_nvenc    (NVIDIA)
  *   - h264_qsv      (Intel Quick Sync)
- *   - h264_videotoolbox (macOS hosts under Docker Desktop — rare
- *     but harmless to detect)
  *   - libx264       (software fallback, always available)
  *
  * Hosts we deliberately exclude from HW encoder selection:
@@ -87,9 +104,11 @@ function ffmpegEncoders() {
  *     FFmpeg still lists h264_v4l2m2m as available because the
  *     binary was compiled with v4l2 support, but no device exists.
  *     Opening it crashes; we'd end up in a reconnect loop.
- *   - Anything where we couldn't verify the kernel device exists
- *     (we trust ffmpeg -encoders + host signature, not /dev probes
- *      — those would require running as root just to stat).
+ *   - x86/x64 servers without a visible GPU device. Debian FFmpeg can
+ *     list h264_nvenc/h264_qsv because support was compiled in, even
+ *     when Docker has no /dev/nvidia* or /dev/dri device. Picking those
+ *     by name alone makes AMD64 servers reconnect forever instead of
+ *     streaming.
  *
  * We also skip h264_omx (deprecated on Pi OS, broken on 64-bit
  * Pis) and h264_vaapi (requires extra device passthrough).
@@ -111,17 +130,18 @@ function pickEncoder(host) {
   //   - ARM but not a Pi → assume no HW path (rare hosts do, but
   //     they're rare enough that requiring an explicit override
   //     via STREAM_VIDEO_CODEC is the safer default).
-  //   - x86/x64 → consider NVENC / QSV / VideoToolbox.
+  //   - x86/x64 with /dev/nvidia* -> consider NVENC.
+  //   - x86/x64 with /dev/dri/*     -> consider QSV.
+  //   - x86/x64 without GPU devices -> software libx264.
   const candidates = [];
   if (host?.isPi && !host.isPi5) {
     candidates.push({ name: "h264_v4l2m2m", tag: "Raspberry Pi V4L2 M2M (HW)" });
   }
-  if (!isArm) {
-    candidates.push(
-      { name: "h264_nvenc",        tag: "NVIDIA NVENC (HW)" },
-      { name: "h264_qsv",          tag: "Intel Quick Sync (HW)" },
-      { name: "h264_videotoolbox", tag: "Apple VideoToolbox (HW)" },
-    );
+  if (!isArm && hasNvidiaDevice()) {
+    candidates.push({ name: "h264_nvenc", tag: "NVIDIA NVENC (HW)" });
+  }
+  if (!isArm && hasIntelRenderDevice()) {
+    candidates.push({ name: "h264_qsv", tag: "Intel Quick Sync (HW)" });
   }
   for (const c of candidates) {
     // Encoder lines look like:  " V..... h264_nvenc           NVIDIA NVENC ..."

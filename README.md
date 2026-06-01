@@ -23,7 +23,7 @@ overlays, scheduling, and a couple of chat-driven games.
 
 <br/>
 
-![version](https://img.shields.io/badge/version-1.13.8-00f0ff?style=for-the-badge)
+![version](https://img.shields.io/badge/version-1.14.0-00f0ff?style=for-the-badge)
 ![docker](https://img.shields.io/badge/docker-compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 ![nextjs](https://img.shields.io/badge/Next.js-14-000?style=for-the-badge&logo=nextdotjs)
 ![twitch](https://img.shields.io/badge/Twitch-OAuth2-9146FF?style=for-the-badge&logo=twitch&logoColor=white)
@@ -142,13 +142,34 @@ updates, and staff management.
 ### Or use the pre-built images (no build step)
 
 ```bash
-docker compose --profile ghcr up -d
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml up -d
 ```
 
-Pulls `ghcr.io/cachenetworks/cachestream-web` +
-`ghcr.io/cachenetworks/cachestream-streamer`, built multi-arch
-(`amd64` + `arm64`) by GitHub Actions on every tag. Skips the
-~5 minute first-time build.
+Pulls `ghcr.io/nekosuneprojectsforks/cachestream-web`,
+`ghcr.io/nekosuneprojectsforks/cachestream-streamer`, and
+`ghcr.io/nekosuneprojectsforks/cachestream-ingest`, built multi-arch
+(`amd64` + `arm64`) by GitHub Actions. Set `CACHESTREAM_GHCR_OWNER`
+to another lowercase owner if you want images from a different fork.
+Skips the ~5 minute first-time build.
+
+### Or run it as a desktop app (no Docker) — `v1.14`
+
+Prefer not to run Docker? CacheStream also ships as a native
+**desktop app** for **Linux** (x64 + arm64, including Raspberry Pi
+OS 64-bit) and **Windows** (x64 + arm64). One installer bundles
+everything — Chromium, FFmpeg, the panel, and the streamer — so
+there's nothing else to install.
+
+Grab the installer for your platform from the
+[Releases page](https://github.com/cachenetworks/CacheStream/releases)
+(`.AppImage` / `.deb` for Linux, NSIS installer / portable `.exe`
+for Windows), launch it, and the same control panel opens in its own
+window. Log in to Twitch, pick a scene, hit **Start**.
+
+It renders scenes through an offscreen **GPU-accelerated** window at a
+guaranteed frame rate, so the Pi's choppy-scene problem doesn't apply.
+Build it yourself from [`apps/desktop/`](apps/desktop/) — see that
+README for the dev + packaging flow.
 
 ---
 
@@ -230,10 +251,14 @@ CacheStream/
 │   │       ├── logger.js
 │   │       ├── stream.js        Puppeteer → FFmpeg → RTMP pipeline
 │   │       └── api.js           Internal HTTP control API
-│   └── web/                     Next.js 14 + TypeScript
-│       ├── Dockerfile           Multi-stage standalone build
-│       ├── entrypoint.sh        Drops root → nextjs after fixing volume perms
-│       └── src/                 see "Built with" below for the full tree
+│   ├── web/                     Next.js 14 + TypeScript
+│   │   ├── Dockerfile           Multi-stage standalone build
+│   │   ├── entrypoint.sh        Drops root → nextjs after fixing volume perms
+│   │   └── src/                 see "Built with" below for the full tree
+│   └── desktop/                 Electron desktop app (no Docker) — v1.14
+│       ├── src/                 main process, DesktopStreamer, audio relay
+│       ├── scripts/             vendor streamer src + build web bundle
+│       └── electron-builder.yml win/linux × x64/arm64 installers
 ├── examples/                    👈 Copy-paste templates for new scenes + games
 │   ├── README.md
 │   ├── scenes/
@@ -686,6 +711,15 @@ For finer-grained control beyond what the auto-profile picks.
 ### Capture
 - `STREAM_SCREENCAST_QUALITY=60` — drops JPEG quality on the
   Chromium → FFmpeg pipe. Visually identical after H.264.
+- `STREAM_CHROMIUM_GPU=auto` (default) — lets Chromium rasterise
+  scenes on the GPU instead of the CPU software compositor. The
+  screencast is paint-driven, so on a Pi the software path caps the
+  scene at **~3 fps** no matter the encoder settings. `auto` turns
+  the GPU on for a Pi (or any host with a `/dev/dri` render node);
+  you must pass `/dev/dri` into the streamer container — the Pi
+  overlay (`docker-compose.pi.yml`) now does this. Separate from the
+  HW encoder, so it also speeds up the Pi 5. Set `off` for the old
+  software path.
 
 ### Scene-side
 - Avoid `filter: blur(40px)`, full-screen `backdrop-filter`, or
@@ -744,6 +778,22 @@ nc -zv live.twitch.tv 1935
 Stale state cookie or `SESSION_SECRET` changed mid-flow. Restart the
 login. If persistent, the browser may be blocking third-party cookies
 on the Cloudflare hostname.
+
+### Pi scenes look choppy / stuck around 3 FPS
+The Chromium screencast only emits a frame when the page repaints,
+and the CPU software compositor on a Pi can't repaint the animated
+scenes faster than a few times a second — so the broadcast looks
+like a ~3-fps slideshow even though FFmpeg pads it to 30 fps CFR.
+Fix: let Chromium use the GPU.
+- Confirm `STREAM_CHROMIUM_GPU` is `auto` (default) or `on`.
+- Pass the GPU render node into the container. **Pi 4:**
+  `docker compose -f docker-compose.yml -f docker-compose.pi.yml up -d`
+  (the overlay now maps `/dev/dri` alongside the v4l2 encoder).
+  **Pi 5:** map just `/dev/dri` (see the Pi 5 note at the top of
+  `docker-compose.pi.yml`).
+- The streamer's boot log should show `gpu: on (egl, …)`.
+- Still avoid `backdrop-filter: blur`, full-screen `box-shadow`, and
+  giant blurs in custom scenes — they're expensive even on the GPU.
 
 ### Pi runs hot
 - Confirm the auto-profile picked `pi` and (if available) `h264_v4l2m2m`

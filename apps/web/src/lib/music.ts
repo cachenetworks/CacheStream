@@ -50,9 +50,19 @@ import { kvGet, kvSet } from "./db";
 // ended; Twitch then dropped the connection. With two parallel FIFOs
 // + amix dropout_transition=0, the music writer can come and go
 // without ever interrupting the audio stream the streamer is reading.
-const SILENCE_FIFO = "/app/audio/silence.fifo";
-const MUSIC_FIFO   = "/app/audio/music.fifo";
+const SILENCE_FIFO = config.audio.silenceFifo;
+const MUSIC_FIFO   = config.audio.musicFifo;
 const AUDIO_FORMAT = ["-f", "s16le", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2"];
+
+// Audio transport (see config.audio). In "tcp" mode (Electron
+// desktop) the per-track FFmpeg connects to a local relay instead
+// of writing a FIFO, and the relay — not these fillers — provides
+// the always-on silent carrier, so we skip the filler machinery
+// and the mkfifo calls entirely.
+const TCP = config.audio.transport === "tcp";
+const FF  = config.audio.ffmpegPath || "ffmpeg";
+// Where the per-track music FFmpeg sends PCM in tcp mode.
+const MUSIC_SINK = TCP ? `tcp://127.0.0.1:${config.audio.musicTcpPort}` : MUSIC_FIFO;
 
 export type Mode = "idle" | "library" | "radio";
 
@@ -136,8 +146,14 @@ class MusicEngine {
     // the moment the streamer's main FFmpeg tries to open them.
     // Without the music-side filler, the streamer's ffmpeg hangs
     // on open(music.fifo) when nothing is queued.
-    this._startSilenceFiller();
-    this._startMusicFiller();
+    //
+    // In tcp mode (desktop) the relay supplies the always-on silent
+    // carrier, so there's nothing to fill here — the per-track
+    // FFmpeg simply connects to the relay when a track plays.
+    if (!TCP) {
+      this._startSilenceFiller();
+      this._startMusicFiller();
+    }
   }
 
   status(): MusicStatus {
@@ -357,7 +373,8 @@ class MusicEngine {
     // a time — POSIX guarantees both writers' output would be
     // interleaved at byte boundaries, which would corrupt PCM
     // samples. We resume the filler in `proc.on("exit")` below.
-    this._suspendMusicFiller();
+    // In tcp mode there is no filler (the relay handles silence).
+    if (!TCP) this._suspendMusicFiller();
 
     // -re paces real-time so we don't fill the FIFO faster than
     // the streamer drains it.
@@ -381,7 +398,7 @@ class MusicEngine {
       "-vn",
       "-af", `volume=${this.volume.toFixed(3)},${loudnessFilter}`,
       ...AUDIO_FORMAT,
-      "-y", MUSIC_FIFO,
+      "-y", MUSIC_SINK,
     ];
     // v1.13.5: stdout=ignore. FFmpeg writes the PCM audio to
     // the music FIFO (the `-y MUSIC_FIFO` output), not stdout.
@@ -389,7 +406,7 @@ class MusicEngine {
     // setup-time bytes FFmpeg emitted accumulated forever in
     // Node's stream buffer. stderr remains piped because we
     // actively read it for error-pattern detection.
-    const proc = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const proc = spawn(FF, args, { stdio: ["ignore", "ignore", "pipe"] });
     this.ffmpeg = proc;
     proc.stderr.on("data", (chunk) => {
       const line = chunk.toString().trim();
@@ -405,7 +422,7 @@ class MusicEngine {
       // mixing silence — the listener hears the silence.fifo
       // carrier (which is also silence when no music's playing,
       // so it's just quiet, as expected).
-      this._resumeMusicFiller();
+      if (!TCP) this._resumeMusicFiller();
       if (onExit) {
         try { onExit(); } catch (err) { console.warn("[music] onExit:", err); }
       }
@@ -437,7 +454,7 @@ class MusicEngine {
       // slowly accumulate. ignore = the OS discards stderr
       // without ever giving it to us, so there's nothing to
       // accumulate.
-      const proc = spawn("ffmpeg", [
+      const proc = spawn(FF, [
         "-hide_banner", "-loglevel", "error", "-nostats",
         "-re",
         "-f", "lavfi",
@@ -474,7 +491,7 @@ class MusicEngine {
     this._ensureFifos();
     try {
       // v1.13.5: stderr=ignore — same reasoning as silence filler.
-      const proc = spawn("ffmpeg", [
+      const proc = spawn(FF, [
         "-hide_banner", "-loglevel", "error", "-nostats",
         "-re",
         "-f", "lavfi",
@@ -510,6 +527,8 @@ class MusicEngine {
   }
 
   private _ensureFifos(): void {
+    // No FIFOs in tcp mode — the relay owns the audio path.
+    if (TCP) return;
     for (const p of [SILENCE_FIFO, MUSIC_FIFO]) {
       if (fs.existsSync(p)) {
         try {
@@ -539,6 +558,9 @@ class MusicEngine {
   }
 
   private _ensureFifoSilently(): boolean {
+    // In tcp mode the audio path is always "ready" — the relay is
+    // started by the desktop app before the music engine boots.
+    if (TCP) return true;
     try {
       return fs.statSync(SILENCE_FIFO).isFIFO() && fs.statSync(MUSIC_FIFO).isFIFO();
     } catch { return false; }

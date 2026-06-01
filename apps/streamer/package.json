@@ -1,6 +1,6 @@
 {
   "name": "cachestream-streamer",
-  "version": "1.13.8",
+  "version": "1.14.2",
   "private": true,
   "description": "Headless Chromium + FFmpeg worker. Streams a webpage to Twitch RTMP. Controlled over an internal HTTP API by the Next.js web container.",
   "main": "src/index.js",

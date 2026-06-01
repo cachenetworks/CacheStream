@@ -11,10 +11,16 @@
 #   docker compose up -d
 #
 # Pi 5 users:
-#   The BCM2712 has NO fixed-function H.264 encoder — do NOT
-#   use this overlay. Run the base docker-compose.yml on its
-#   own; the streamer auto-detects Pi 5 and applies a tuned
-#   libx264 profile (720p30 veryfast) automatically.
+#   The BCM2712 has NO fixed-function H.264 encoder, so do NOT
+#   map the /dev/video* encoder devices below (they don't exist
+#   and Docker errors out). The streamer auto-detects Pi 5 and
+#   applies a tuned libx264 profile (720p30 veryfast) for you.
+#   BUT the Pi 5 DOES have a GPU for rendering — to fix choppy
+#   ~3-fps scenes you still want the /dev/dri render node. Easiest:
+#   create a tiny docker-compose.pi5.yml with just the streamer
+#   `devices: [/dev/dri:/dev/dri]` + `group_add: [render]` blocks
+#   from below (drop the /dev/video* lines), and run
+#   `docker compose -f docker-compose.yml -f docker-compose.pi5.yml up -d`.
 #
 # ─────────────────────────────────────────────────────────
 # Before using this file on Pi 4, check which video devices
@@ -51,10 +57,19 @@ services:
       # work. Comment these out if your Pi only has video11.
       - /dev/video10:/dev/video10
       - /dev/video12:/dev/video12
+      # GPU render node (VideoCore / V3D). Lets Chromium rasterise
+      # scenes on the GPU instead of the slow CPU SwiftShader path
+      # — this is what fixes the "~3 fps" choppy-scene problem.
+      # It is SEPARATE from the v4l2 H.264 encoder above, so it
+      # also helps the Pi 5 (which has a GPU for rendering but no
+      # fixed-function H.264 encoder). Needs STREAM_CHROMIUM_GPU
+      # to be `auto` (the default, auto-detects Pi) or `on`.
+      - /dev/dri:/dev/dri
     # Some Pi OS installs gate the video devices behind the
-    # `video` group rather than world-rw. Adding the streamer
-    # user to it (entrypoint runs as root briefly, so this
-    # supplementary group survives the setpriv drop) covers
-    # both layouts.
+    # `video` group and the GPU render node behind the `render`
+    # group rather than world-rw. Adding the streamer user to both
+    # (entrypoint runs as root briefly, so these supplementary
+    # groups survive the setpriv drop) covers all layouts.
     group_add:
       - video
+      - render

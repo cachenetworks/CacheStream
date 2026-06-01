@@ -1,0 +1,44 @@
+{
+  "name": "cachestream-desktop",
+  "version": "1.14.2",
+  "private": true,
+  "description": "CacheStream as a native desktop app — runs the panel + streams a webpage to Twitch without Docker. Bundles Chromium (Electron) + a static FFmpeg.",
+  "main": "src/main.js",
+  "author": {
+    "name": "CacheNetworks",
+    "email": "noreply@github.com"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NekoSuneProjectsForks/CacheStream.git",
+    "directory": "apps/desktop"
+  },
+  "scripts": {
+    "sync-streamer": "node scripts/sync-streamer.mjs",
+    "build-web": "node scripts/build-web.mjs",
+    "predev": "npm run sync-streamer",
+    "dev": "electron .",
+    "rebuild": "electron-rebuild -f -w better-sqlite3 -m ../web",
+    "prepack-app": "node scripts/sync-streamer.mjs && node scripts/build-web.mjs",
+    "pack:dir": "npm run prepack-app && electron-builder --dir",
+    "dist": "npm run prepack-app && electron-builder",
+    "dist:linux": "npm run prepack-app && electron-builder --linux --x64 --arm64",
+    "dist:win": "npm run prepack-app && electron-builder --win --x64 --arm64"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "pino": "^9.5.0",
+    "pino-pretty": "^11.2.2"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.2.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.7.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}

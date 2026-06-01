@@ -130,6 +130,27 @@ export const config = {
     // Compose mounts ./media/music here from the host.
     libraryDir: optional("MUSIC_LIBRARY_DIR", "/app/media/music"),
   },
+  audio: {
+    // How the music engine hands PCM to the streamer's FFmpeg.
+    //
+    //   "fifo" (default) — Docker / Linux. Two named FIFOs on the
+    //          shared volume (silence + music), created with mkfifo.
+    //          Byte-identical to all prior releases.
+    //   "tcp"  — the Electron desktop app. There is no mkfifo on
+    //          Windows and no shared volume, so the per-track music
+    //          FFmpeg connects to a local TCP relay instead; the
+    //          desktop app's relay provides the always-on silent
+    //          carrier (so the silence/music fillers are skipped).
+    transport: (optional("AUDIO_TRANSPORT", "fifo") === "tcp" ? "tcp" : "fifo") as
+      "fifo" | "tcp",
+    silenceFifo: optional("SILENCE_FIFO_PATH", "/app/audio/silence.fifo"),
+    musicFifo:   optional("MUSIC_FIFO_PATH",   "/app/audio/music.fifo"),
+    // TCP-transport target the per-track music FFmpeg connects to.
+    musicTcpPort: Number.parseInt(optional("MUSIC_TCP_PORT", "7790"), 10),
+    // Bundled FFmpeg path for the desktop build (no ffmpeg on PATH
+    // on Windows). Empty → use the PATH `ffmpeg`, as in Docker.
+    ffmpegPath: optional("FFMPEG_PATH", "ffmpeg"),
+  },
   vods: {
     // Path inside the web container where VOD video files live.
     // Compose mounts ./media/vods here from the host (read-write

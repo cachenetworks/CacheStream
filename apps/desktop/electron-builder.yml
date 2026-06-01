@@ -1,0 +1,55 @@
+appId: com.cachenetworks.cachestream
+productName: CacheStream
+copyright: MIT — CacheNetworks
+directories:
+  output: dist
+  buildResources: build
+
+# What goes inside the app bundle (the asar). The Electron main
+# process + its small dependency tree. The Next.js panel itself is
+# NOT in here — it ships as an unpacked extraResource (below) so its
+# native better-sqlite3 binary and the standalone server can be run
+# as a child Node process.
+files:
+  - src/**/*
+  - package.json
+  - "!**/*.map"
+
+# ffmpeg-static keeps a platform binary in node_modules; it must be
+# OUTSIDE the asar to be spawnable. better-sqlite3 is not here (it
+# lives in the unpacked web bundle) but unpack it too if it ever is.
+asarUnpack:
+  - "**/node_modules/ffmpeg-static/**"
+  - "**/node_modules/better-sqlite3/**"
+
+# The built Next.js standalone panel (produced by scripts/build-web.mjs
+# into ./build/web) is copied verbatim into the app's resources dir.
+# At runtime main.js launches build/web/server.js via utilityProcess.
+# A per-arch vendored ffmpeg (build/ffmpeg/${platform}-${arch}) is
+# copied when present — used for targets ffmpeg-static doesn't cover
+# (notably win32 arm64).
+extraResources:
+  - from: build/web
+    to: web
+  - from: build/ffmpeg/${platform}-${arch}
+    to: ffmpeg
+    filter: ["**/*"]
+
+linux:
+  category: AudioVideo
+  maintainer: CacheNetworks <noreply@github.com>
+  target:
+    - AppImage
+    - deb
+  artifactName: CacheStream-${version}-linux-${arch}.${ext}
+
+win:
+  target:
+    - nsis
+    - portable
+  artifactName: CacheStream-${version}-win-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true

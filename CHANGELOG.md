@@ -1,5 +1,140 @@
 # Changelog
 
+## 1.14.2
+
+Desktop Linux ARM64 packaging and AMD64 Docker streaming fixes.
+
+### Desktop CI
+
+- Fixed the Linux ARM64 desktop workflow failing while building `.deb`
+  installers with `Exec format error`.
+- The ARM64 runner now installs and uses a native Ruby `fpm` instead
+  of electron-builder's bundled x86-only `fpm` binary.
+- Electron Builder target config now lets each matrix job build only
+  its requested architecture, preventing the ARM64 job from also
+  trying to package x64 Linux artifacts.
+
+### Docker streamer
+
+- AMD64 Docker servers now default to software `libx264` unless a
+  usable NVIDIA or Intel render device is visible inside the
+  container, preventing reconnect loops caused by FFmpeg selecting
+  unavailable hardware encoders.
+- Hardware encoder fallback detection now also catches CUDA, NVENC,
+  QSV, and Media SDK startup failures, so the streamer can recover to
+  software encoding instead of repeatedly failing to start.
+
+### Versions
+
+- Bumped the web, streamer, and desktop package versions to `1.14.2`.
+
+## 1.14.1
+
+AMD64 Docker streamer stability fix.
+
+### Docker streamer
+
+- Fixed the AMD64 `cachestream-streamer` container failing to start
+  Chromium with `chrome_crashpad_handler: --database is required`.
+- The streamer image now gives Chromium a writable non-root
+  `HOME`, XDG config/cache directories, and a dedicated runtime
+  directory under `/tmp`.
+- Chromium now launches with an isolated temporary profile plus an
+  explicit crash dump directory, then cleans that profile up during
+  teardown/reconnect.
+- Crash reporting is disabled for the headless capture browser, which
+  avoids crashpad startup failures while keeping the existing
+  Puppeteer -> FFmpeg streaming pipeline unchanged.
+
+### Release notes
+
+This is primarily for x64/AMD64 Docker deployments using the GHCR or
+local Docker images. ARM64/Pi-specific compose behavior is unchanged.
+
+## 1.14.0
+
+Native **desktop app** — CacheStream now runs without Docker on
+Linux (x64 + arm64, incl. Raspberry Pi) and Windows (x64 + arm64).
+
+### What it is
+
+A new `apps/desktop/` Electron app that bundles Chromium, a static
+FFmpeg, the panel, and the streamer into a single installer
+(AppImage / `.deb` / NSIS / portable `.exe`). Double-click, log in
+to Twitch, hit Start — nothing else to install.
+
+It reuses the existing pieces rather than forking them:
+
+- The unmodified Next.js panel (`apps/web`) runs as a child process
+  via Electron's `utilityProcess.fork`.
+- A new `DesktopStreamer` renders `/scene/*` through an **offscreen,
+  GPU-accelerated** `BrowserWindow` at a fixed `setFrameRate`, pipes
+  JPEG frames to the bundled FFmpeg, and exposes the **same**
+  `127.0.0.1` control API the panel already speaks (the streamer's
+  `api.js` is shared verbatim). Because Electron renders on the GPU,
+  the desktop app sidesteps the Pi software-compositor FPS problem
+  with no flags.
+- The H.264/AAC argv builders were extracted to
+  `apps/streamer/src/ffmpeg.js` and are shared by both backends.
+
+### Cross-platform audio
+
+The Linux build pipes music through named FIFOs (`mkfifo`), which
+don't exist on Windows. A new `AUDIO_TRANSPORT=fifo|tcp` switch
+(default `fifo` — Docker is byte-identical) lets the desktop app use
+`tcp` instead: the per-track music FFmpeg connects to a small
+loopback-TCP relay that supplies the always-on silent carrier, so
+the broadcast's audio input never drops between tracks. `autoprofile`
+and the music engine now also honour `FFMPEG_PATH` so the bundled
+binary is used when there's no `ffmpeg` on `PATH`.
+
+### CI
+
+`.github/workflows/desktop.yml` builds all four targets on matching
+native runners and attaches the installers to the tagged release.
+
+## 1.13.9
+
+GPU rasterisation for the headless Chromium scene renderer —
+fixes the "scenes are stuck at ~3 fps on a Raspberry Pi" problem.
+
+### Why scenes were choppy
+
+`Page.startScreencast` is paint-driven: Chromium only hands us a
+frame when its compositor produces one. The streamer hard-forced
+`--disable-gpu` **and** `--disable-software-rasterizer`, pinning
+all compositing to the CPU SwiftShader path. On a Pi, software-
+compositing the animated scenes (gradients, `backdrop-filter`
+blur, big `box-shadow`) at 720p saturates the CPU and the page
+only repaints ~3 times a second. FFmpeg dutifully padded that to
+30 fps CFR, so the broadcast *looked* like a 3-fps slideshow even
+though Twitch was receiving 30 fps.
+
+### `STREAM_CHROMIUM_GPU=auto|on|off`
+
+New knob (default `auto`). `auto` enables GPU rasterisation when
+the host is a Pi or exposes a `/dev/dri/renderD128` render node;
+`on`/`off` force it. When on, the launcher drops the two
+`--disable-*` flags and adds `--enable-gpu-rasterization`,
+`--ignore-gpu-blocklist`, `--enable-zero-copy`, `--use-gl=egl`,
+`--disable-frame-rate-limit`. GPU init failure falls back to
+software on its own, so the worst case is the old behaviour.
+
+This is unrelated to the `h264_v4l2m2m` hardware *encoder* (a
+separate block), so it also speeds up the **Pi 5**, which has a
+GPU for rendering but no fixed-function H.264 encoder.
+
+### Plumbing
+
+- The streamer image now ships the Mesa DRI/EGL userspace drivers
+  (`libegl1`, `libgles2`, `libgl1-mesa-dri`, `mesa-va-drivers`)
+  so in-container Chromium can actually reach the GPU.
+- `docker-compose.pi.yml` now maps `/dev/dri` and adds the
+  `render` supplementary group alongside the existing v4l2
+  encoder devices. Pi 5 guidance added for a `/dev/dri`-only
+  overlay.
+- The streamer's boot log reports the chosen GPU mode.
+
 ## 1.13.8
 
 Three log-noise fixes — `docker compose logs` was unreadable on

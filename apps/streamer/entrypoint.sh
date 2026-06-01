@@ -17,6 +17,18 @@ if [ -d "/app/audio" ]; then
   chmod 0777 /app/audio 2>/dev/null || true
 fi
 
+# Chromium runs after we drop privileges. Keep HOME/XDG paths off
+# /root and provide writable profile/crashpad directories on /tmp.
+export HOME=/home/streamer
+export XDG_CONFIG_HOME=/home/streamer/.config
+export XDG_CACHE_HOME=/home/streamer/.cache
+export CHROMIUM_RUNTIME_DIR="${CHROMIUM_RUNTIME_DIR:-/tmp/cachestream-chromium}"
+mkdir -p "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+  "$CHROMIUM_RUNTIME_DIR/profiles" "$CHROMIUM_RUNTIME_DIR/crashpad" 2>/dev/null || true
+chown -R streamer:streamer "$HOME" "$CHROMIUM_RUNTIME_DIR" 2>/dev/null || true
+chmod 0700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" 2>/dev/null || true
+chmod 0777 "$CHROMIUM_RUNTIME_DIR" "$CHROMIUM_RUNTIME_DIR/profiles" "$CHROMIUM_RUNTIME_DIR/crashpad" 2>/dev/null || true
+
 # Existing FIFOs may have been created by the web container
 # with mkfifo's default 0644 (umask 0022). The streamer user
 # can't open them O_RDWR for the keep-alive trick we use to

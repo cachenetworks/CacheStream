@@ -1,5 +1,6 @@
 "use strict";
 
+const fs = require("node:fs");
 const { pickAutoProfile } = require("./autoprofile");
 
 function toInt(value, fallback) {
@@ -73,6 +74,34 @@ function buildConfig({ logger } = {}) {
     return fallback;
   };
 
+  // ── Chromium GPU mode ────────────────────────────────────────
+  // STREAM_CHROMIUM_GPU = auto | on | off
+  //
+  // The screencast is paint-driven: Chromium only emits a frame
+  // when the compositor produces one. Forcing `--disable-gpu`
+  // pins compositing to SwiftShader (CPU GL); on a Pi, software-
+  // compositing the animated scenes at 720p saturates the CPU and
+  // the page only paints ~3 fps — the broadcast looks like a 3-fps
+  // slideshow even though FFmpeg pads it to 30 CFR.
+  //
+  // Letting Chromium rasterise on the GPU (Pi VideoCore / V3D, or
+  // any host exposing a /dev/dri render node) lifts that ceiling
+  // dramatically. This is unrelated to the h264_v4l2m2m HW *encoder*
+  // (a separate block) — so it helps the Pi 5 too, which has a GPU
+  // for rendering but no fixed-function H.264 encoder.
+  //
+  //   auto → on when the host is a Pi OR /dev/dri/renderD128 exists.
+  //   on   → always enable GPU rasterisation flags.
+  //   off  → keep the legacy --disable-gpu software path.
+  const gpuMode = (envVal("STREAM_CHROMIUM_GPU") || "auto").toLowerCase();
+  const hasRenderNode = (() => {
+    try { return fs.existsSync("/dev/dri/renderD128"); } catch { return false; }
+  })();
+  const gpuEnabled =
+    gpuMode === "on" ? true :
+    gpuMode === "off" ? false :
+    Boolean(auto?.host?.isPi) || hasRenderNode; // auto
+
   return {
     api: {
       port: toInt(process.env.STREAMER_PORT, 7789),
@@ -106,6 +135,11 @@ function buildConfig({ logger } = {}) {
       // encoder (h264_v4l2m2m on a Pi, etc.). Operator can force
       // libx264 with STREAM_VIDEO_CODEC=libx264.
       codec: pickStr("STREAM_VIDEO_CODEC", "codec", "libx264"),
+      // Chromium GPU rasterisation. `gpuMode` is the raw env choice
+      // (auto|on|off); `gpuEnabled` is the resolved boolean the
+      // browser launcher acts on (see stream.js buildChromiumGpuArgs).
+      gpuMode,
+      gpuEnabled,
     },
     audio: {
       bitrateKbps: pickInt("STREAM_AUDIO_BITRATE", "audioBitrateKbps", 128),

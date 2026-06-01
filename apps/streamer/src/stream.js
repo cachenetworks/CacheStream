@@ -1,6 +1,8 @@
 "use strict";
 
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 /**
@@ -37,138 +39,40 @@ const { spawnSync } = require("node:child_process");
 const { spawn } = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const puppeteer = require("puppeteer-core");
+const { buildVideoCodecArgs, buildVideoFilters } = require("./ffmpeg");
 
 const OVERLAY_CONTAINER_ID = "__cachestream_overlays__";
 
 /**
- * Build the codec-specific portion of the FFmpeg argv.
+ * Build the GPU-related Chromium flags.
  *
- * The auto-profile may pick a hardware encoder (h264_v4l2m2m on a
- * Raspberry Pi, h264_nvenc on NVIDIA, etc.). Those encoders ignore
- * libx264's `-preset` / `-tune` / `-x264-params` flags and need
- * their own. This helper centralises the differences so the main
- * argv stays readable.
+ * The screencast is paint-driven: Chromium only emits a frame when
+ * the compositor produces one. The legacy flag set forced
+ * `--disable-gpu` + `--disable-software-rasterizer`, which pins all
+ * compositing to SwiftShader (CPU GL). On a Pi that caps the page
+ * at ~3 painted fps for the animated scenes — a 3-fps slideshow.
+ *
+ * When `gpuEnabled` is true we let Chromium rasterise on the GPU
+ * instead (Pi VideoCore / V3D via Mesa EGL, or any host with a
+ * /dev/dri render node). `--disable-frame-rate-limit` lets the
+ * compositor produce frames as fast as the page repaints rather
+ * than clamping to the default cap.
+ *
+ * If GPU init fails at runtime Chromium falls back to software on
+ * its own; the worst case is the old behaviour, and the streamer's
+ * reconnect machinery covers an outright crash.
  */
-function buildVideoCodecArgs(video) {
-  const codec = video.codec || "libx264";
-  const common = [
-    "-c:v", codec,
-    "-pix_fmt", "yuv420p",
-    "-r", String(video.fps),
-    "-g", String(video.fps * 2),
-    "-keyint_min", String(video.fps * 2),
-    "-sc_threshold", "0",
-    "-b:v", `${video.bitrateKbps}k`,
-    "-maxrate", `${video.maxrateKbps}k`,
-    "-bufsize", `${video.bufsizeKbps}k`,
-  ];
-
-  if (codec === "libx264") {
-    return [
-      ...common,
-      "-preset", video.preset,
-      ...(video.tune ? ["-tune", video.tune] : []),
-      "-profile:v", "high",
-      "-x264-params", `threads=${video.x264Threads || 0}:lookahead-threads=1`,
-    ];
+function buildChromiumGpuArgs(gpuEnabled) {
+  if (!gpuEnabled) {
+    return ["--disable-gpu", "--disable-software-rasterizer"];
   }
-
-  if (codec === "h264_nvenc") {
-    return [
-      ...common,
-      // NVENC's analogue of `veryfast`. p1=fastest, p7=slowest.
-      "-preset", "p4",
-      "-tune",   "ll",         // low-latency for live streaming
-      "-rc",     "cbr",
-      "-profile:v", "high",
-    ];
-  }
-
-  if (codec === "h264_qsv") {
-    return [
-      ...common,
-      "-preset", "veryfast",
-      "-profile:v", "high",
-      "-look_ahead", "0",
-    ];
-  }
-
-  if (codec === "h264_v4l2m2m") {
-    // Raspberry Pi hardware encoder. Doesn't support `-preset` —
-    // its quality control is bitrate alone (already set in common).
-    // num_capture_buffers=32 prevents the Pi's frame-grabber from
-    // running dry under jitter.
-    return [
-      ...common,
-      "-num_capture_buffers", "32",
-    ];
-  }
-
-  if (codec === "h264_videotoolbox") {
-    return [
-      ...common,
-      "-profile:v", "high",
-      "-allow_sw", "1",
-    ];
-  }
-
-  // Unknown codec — fall back to libx264 flags rather than break.
   return [
-    ...common,
-    "-preset", video.preset,
-    "-profile:v", "high",
+    "--ignore-gpu-blocklist",
+    "--enable-gpu-rasterization",
+    "--enable-zero-copy",
+    "--use-gl=egl",
+    "--disable-frame-rate-limit",
   ];
-}
-
-/**
- * Build the minimum video filter chain for the configured output.
- *
- * The defaults (Chromium screencast at the same width/height/fps
- * we're encoding at) need NO filters at all — the input is already
- * the right size, the right rate, and yuvj420p which the encoder
- * accepts directly thanks to `-pix_fmt yuv420p` in
- * buildVideoCodecArgs.
- *
- * Filters cost real CPU per frame in software-only pipelines (the
- * Pi 5 path). Eliding them entirely in the common case is a
- * measurable win:
- *
- *   - `fps=N` runs framerate conversion + drops/duplicates frames.
- *     Skipped when capture fps already equals output fps.
- *   - `scale=WxH` is sws_scale on every frame. Skipped when capture
- *     resolution already equals output resolution.
- *   - `format=yuv420p` is a colour-space conversion. Skipped because
- *     the encoder's `-pix_fmt yuv420p` does the same conversion
- *     once at the encoder boundary instead of per-frame in a filter.
- *
- * Returns an array of comma-joined filter steps. When no filters
- * are needed the caller can use an `fps` filter as a cheap pass-
- * through, but in practice we elide the chain entirely (see
- * _spawnFFmpeg). Returns null when no filters needed.
- */
-function buildVideoFilters(video) {
-  const steps = [];
-  // Chromium's screencast emits frames at the rate the page
-  // repaints, capped by `everyNthFrame`. When `captureEveryNthFrame
-  // === 1` and the page renders at a stable rate ≥ video.fps,
-  // Chromium effectively gives us video.fps frames already — the
-  // `fps=` filter would be a no-op pacer.
-  //
-  // Conservative: only skip when Chromium is configured to produce
-  // exactly the target rate. If the operator runs with a different
-  // capture cadence (e.g. captureEveryNthFrame > 1 for low-CPU
-  // mode), we still need the pacer.
-  if (video.captureEveryNthFrame && video.captureEveryNthFrame > 1) {
-    steps.push(`fps=${video.fps}`);
-  }
-  // Chromium's `maxWidth`/`maxHeight` in Page.startScreencast scales
-  // to fit while preserving aspect — so if the viewport matches the
-  // output dims exactly, the frames arrive already sized. Skip the
-  // scaler. If they ever mismatch, FFmpeg's encoder-side rescale
-  // (when needed) is still happy to consume different input sizes.
-  // Operators with mismatched viewport vs output should set those
-  // env vars consistently for best quality + lowest CPU.
-  return steps.length > 0 ? steps.join(",") : null;
 }
 
 class Streamer extends EventEmitter {
@@ -196,6 +100,7 @@ class Streamer extends EventEmitter {
     this.overlays = []; // [{ id, type:'text'|'html'|'image', ...payload }]
 
     this.browser = null;
+    this.browserProfileDir = null;
     this.page = null;
     this.client = null;
     this.ffmpeg = null;
@@ -550,6 +455,9 @@ class Streamer extends EventEmitter {
         resolution: `${this.config.video.width}x${this.config.video.height}`,
         fps: this.config.video.fps,
         scene: this.sceneUrl,
+        gpu: this.config.video.gpuEnabled
+          ? `on (egl, mode=${this.config.video.gpuMode})`
+          : `off (software, mode=${this.config.video.gpuMode})`,
       },
       "streaming to twitch"
     );
@@ -557,22 +465,34 @@ class Streamer extends EventEmitter {
 
   async _launchBrowser() {
     const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+    const runtimeDir = process.env.CHROMIUM_RUNTIME_DIR || path.join(os.tmpdir(), "cachestream-chromium");
+    const profileRoot = path.join(runtimeDir, "profiles");
+    const crashpadDir = path.join(runtimeDir, "crashpad");
+    fs.mkdirSync(profileRoot, { recursive: true });
+    fs.mkdirSync(crashpadDir, { recursive: true });
+    this.browserProfileDir = fs.mkdtempSync(path.join(profileRoot, "profile-"));
 
-    this.browser = await puppeteer.launch({
-      executablePath: execPath,
-      headless: "new",
-      defaultViewport: {
-        width: this.config.video.width,
-        height: this.config.video.height,
-        deviceScaleFactor: 1,
-      },
-      args: [
+    try {
+      this.browser = await puppeteer.launch({
+        executablePath: execPath,
+        headless: "new",
+        userDataDir: this.browserProfileDir,
+        defaultViewport: {
+          width: this.config.video.width,
+          height: this.config.video.height,
+          deviceScaleFactor: 1,
+        },
+        args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu",
+        // GPU flags are mode-dependent (STREAM_CHROMIUM_GPU). When
+        // off this re-adds --disable-gpu + --disable-software-
+        // rasterizer (legacy software path); when on it enables GPU
+        // rasterisation so the Pi compositor can keep up with the
+        // scene's paint rate instead of choking at ~3 fps.
+        ...buildChromiumGpuArgs(this.config.video.gpuEnabled),
         "--no-zygote",
-        "--disable-software-rasterizer",
         "--disable-background-timer-throttling",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
@@ -605,13 +525,19 @@ class Streamer extends EventEmitter {
         "--disable-domain-reliability",
         "--disable-client-side-phishing-detection",
         "--disable-breakpad",
+        "--disable-crash-reporter",
+        `--crash-dumps-dir=${crashpadDir}`,
         "--metrics-recording-only",
         "--no-pings",
         "--password-store=basic",
         "--use-mock-keychain",
         `--window-size=${this.config.video.width},${this.config.video.height}`,
-      ],
-    });
+        ],
+      });
+    } catch (err) {
+      this._cleanupBrowserProfile();
+      throw err;
+    }
 
     this.browser.on("disconnected", () => {
       if (this.shouldRun && this.state !== "stopping") {
@@ -831,7 +757,7 @@ class Streamer extends EventEmitter {
     // When we see any of these AND the current codec is not libx264,
     // we'll silently fall back on the next pipeline restart.
     let hwEncoderFailed = false;
-    const hwFailurePatterns = /v4l2|video11|h264_v4l2m2m|h264_nvenc|h264_qsv|cannot open codec|cannot open device|operation not permitted|no such device/i;
+    const hwFailurePatterns = /v4l2|video11|h264_v4l2m2m|h264_nvenc|h264_qsv|libcuda|cuda|nvenc|qsv|mfx|cannot open codec|cannot open device|error initializing output stream|operation not permitted|no such device/i;
 
     // ── Twitch ingest accept/reject signal ──────────────────────
     //
@@ -1227,7 +1153,6 @@ class Streamer extends EventEmitter {
    * is on a docker volume shared with the web container.
    */
   _ensureAudioFifos() {
-    const path = require("node:path");
     const fifos = [
       process.env.SILENCE_FIFO_PATH || "/app/audio/silence.fifo",
       process.env.MUSIC_FIFO_PATH   || "/app/audio/music.fifo",
@@ -1315,6 +1240,7 @@ class Streamer extends EventEmitter {
         try { proc?.kill?.("SIGKILL"); } catch {}
         this.browser = null;
       }
+      this._cleanupBrowserProfile();
     })();
 
     let timedOut = false;
@@ -1337,6 +1263,18 @@ class Streamer extends EventEmitter {
       try { this.page = null; } catch {}
       try { this.browser?.process?.()?.kill?.("SIGKILL"); } catch {}
       this.browser = null;
+      this._cleanupBrowserProfile();
+    }
+  }
+
+  _cleanupBrowserProfile() {
+    const dir = this.browserProfileDir;
+    this.browserProfileDir = null;
+    if (!dir) return;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch (err) {
+      this.logger.debug({ err, dir }, "chromium profile cleanup failed");
     }
   }
 }
