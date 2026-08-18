@@ -16,10 +16,11 @@ import { onTokensRefreshed, markRefreshTokenAlive } from "@/lib/twitch/tokens";
  *
  * Validates the OAuth state (CSRF defence), exchanges the code
  * for tokens, fetches the Twitch user, then:
- *   - if no owner is set, claims ownership (first-login-wins)
+ *   - requires the deployment owner to have been explicitly seeded
+ *     with INITIAL_OWNER_LOGIN (no first-login-wins ownership claim)
  *   - if logged-in user matches the owner → issues a session,
  *     persists the broadcaster's tokens, kicks off chat + EventSub
- *   - otherwise → 403 deny page
+ *   - otherwise → invite flow for moderators, or 403
  */
 export const dynamic = "force-dynamic";
 
@@ -62,14 +63,21 @@ export async function GET(req: NextRequest) {
   }
 
   const store = getStore();
-  store.claimOwnerIfUnset(user);
+  const configuredOwner = store.getOwner();
+  if (!configuredOwner) {
+    return renderError(
+      "This CacheStream instance has no configured owner. Set <b>INITIAL_OWNER_LOGIN</b> " +
+        "to the intended broadcaster's Twitch login and restart CacheStream before signing in. " +
+        "Ownership is never assigned to the first visitor.",
+      503,
+    );
+  }
 
   const isOwner = store.isOwner({ id: user.id, login: user.login });
 
-  // v1.13.0: if the user isn't the owner, check whether they
-  // arrived carrying an invite cookie. If so, consume it + add
-  // them as a moderator. If not (or the invite is invalid),
-  // fall through to the existing 403 deny page.
+  // If the user isn't the owner, check whether they arrived carrying an invite
+  // cookie. If so, consume it + add them as a moderator. If not (or the invite
+  // is invalid), fall through to the 403 deny page.
   if (!isOwner) {
     const inviteSigned = req.cookies.get("cs_invite")?.value;
     const inviteCode = unsign(inviteSigned);
@@ -88,10 +96,6 @@ export async function GET(req: NextRequest) {
         res.cookies.delete("cs_invite");
         return res;
       }
-      // Moderator accepted — issue a session, skip the token save
-      // (moderators don't replace the broadcaster's Helix identity),
-      // and bounce to /admin where the panel will show them their
-      // role badge.
       const { sid: modSid, expiresAt: modExpiresAt } = store.createSession(user);
       const res = NextResponse.redirect(`${config.web.publicUrl}/admin`);
       res.cookies.delete(STATE_COOKIE);
@@ -116,45 +120,24 @@ export async function GET(req: NextRequest) {
   store.upgradeOwnerFromUser(user);
   const { sid, expiresAt } = store.createSession(user);
 
-  // Persist broadcaster tokens for Helix + chat + EventSub use.
-  // We only do this on the owner branch — moderators authenticate
-  // with their OWN Twitch identity but their tokens are throwaway,
-  // since the broadcaster's tokens are what drive Helix calls.
   store.saveTokens({
     accessToken: token.access_token,
     refreshToken: token.refresh_token || null,
-    expiresAt: Date.now() + (token.expires_in - 60) * 1000, // 60s safety buffer
+    expiresAt: Date.now() + (token.expires_in - 60) * 1000,
     scopes: token.scope || [],
     twitchUserId: user.id,
     updatedAt: Date.now(),
   });
 
-  // Clear any "refresh token dead" flag set during a previous
-  // session — these tokens are fresh and will work.
   markRefreshTokenAlive();
 
-  // Fire-and-forget hook so the chat + EventSub clients can pick
-  // up the new tokens immediately rather than wait for first use.
   try { await onTokensRefreshed(); } catch (err) { console.warn("[oauth] post-token hook:", err); }
 
-  // Boot chat + eventsub if this is the first login since startup
-  // (bootOnce ran with no tokens → skipped service start). Idempotent
-  // so re-logins are safe. Fixes the silent-dead-chat bug where the
-  // panel showed everything fine but EventSub was never connected
-  // because bootOnce's one-shot flag had already flipped to true.
   try {
     const { startServicesIfReady } = await import("@/lib/boot");
     startServicesIfReady();
   } catch (err) { console.warn("[oauth] service-start hook:", err); }
 
-  // Auto-pull the broadcaster's current stream key from Helix and
-  // push it to the streamer. Run async so the redirect to /admin
-  // isn't blocked — the result is visible in the Stream Info card
-  // by the time the operator gets there.
-  //
-  // We do this on every callback (login OR re-auth) because the
-  // broadcaster may have rotated their key on Twitch since their
-  // last login. Fresh key every time = no stale-key surprises.
   if (token.scope?.includes("channel:read:stream_key")) {
     (async () => {
       try {
@@ -171,11 +154,6 @@ export async function GET(req: NextRequest) {
     })();
   }
 
-  // If this login originated from the setup wizard, mark setup
-  // complete and clear the origin cookie. The /admin redirect
-  // below is unchanged either way — the wizard's gate (in
-  // /setup/page.tsx) will start sending fresh hits to /admin once
-  // it sees `isSetupComplete()` flip true.
   const originSigned = req.cookies.get("cs_oauth_origin")?.value;
   const origin = unsign(originSigned);
   if (origin === "setup") {
