@@ -18,7 +18,10 @@ services:
       PORT: ${WEB_PORT:-7788}
       HOSTNAME: 0.0.0.0
     ports:
-      - "${WEB_PORT:-7788}:${WEB_PORT:-7788}"
+      # Security-first: the control/setup surface is host-local by default.
+      # A deliberately configured Cloudflare Tunnel/reverse proxy can still
+      # publish it without exposing first-run setup directly on the LAN/WAN.
+      - "127.0.0.1:${WEB_PORT:-7788}:${WEB_PORT:-7788}"
     volumes:
       - cachestream-data:/app/data           # SQLite DB + cover art
       - ./media/music:/app/media/music       # music library (read-write for uploads)
